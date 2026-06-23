@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from modelings.sgsa_ops import chunk_sgsa, naive_recurrent_sgsa
+from modelings.sgsa_ops import chunk_sgsa, fused_recurrent_sgsa, naive_recurrent_sgsa
 
 _ROOT = Path(__file__).resolve().parents[1]
 _FLA_LOCAL = _ROOT / "flash-linear-attention"
@@ -66,7 +66,7 @@ class SGSAConfig:
     sink_size: int = 8
     sparse_output_lambda: float = 0.0
     tie_word_embeddings: bool = True
-    linear_backend: str = "auto"  # auto | python | torch_chunk | fla_gdn
+    linear_backend: str = "auto"  # auto | python | torch_chunk | recurrent | triton_recurrent | fla_gdn
     retrieval_backend: str = "auto"  # auto | torch | flash_moba
     chunk_size: int = 64
 
@@ -557,6 +557,7 @@ class SGSAStateLayer(nn.Module):
             and self.write_mode == "none"
             and init_state is None
         )
+        use_recurrent_path = self.linear_backend in ("recurrent", "triton_recurrent", "fused_recurrent")
         use_torch_chunk_path = (
             self.linear_backend in ("auto", "torch_chunk")
             and (self.write_mode != "none" or not use_fla_path)
@@ -565,6 +566,20 @@ class SGSAStateLayer(nn.Module):
             attended = self._fla_gdn_forward(q=q, k=k, v=v, beta=beta, gamma=gamma)
             # Keep state output for API compatibility when using kernel path.
             state = hidden_states.new_zeros(bsz, num_heads, dim, dim)
+        elif use_recurrent_path:
+            attended, state = fused_recurrent_sgsa(
+                q=q,
+                k=k,
+                v=v,
+                beta=beta,
+                gamma=gamma,
+                sparse_k=write_key if self.write_mode != "none" else None,
+                sparse_v=v_hat if self.write_mode != "none" else None,
+                alpha=alpha if self.write_mode != "none" else None,
+                initial_state=state,
+                output_final_state=True,
+                use_triton=self.linear_backend != "recurrent",
+            )
         elif use_torch_chunk_path:
             attended, state = chunk_sgsa(
                 q=q,
@@ -599,6 +614,7 @@ class SGSAStateLayer(nn.Module):
             "k_hat_perp_norm_ratio": (k_hat_perp.norm(dim=-1) / k_hat.norm(dim=-1).clamp_min(self.eps)).clamp(0.0, 10.0) if self.write_mode == "residual" else None,
             "used_fla_gdn": torch.tensor(float(use_fla_path), device=hidden_states.device),
             "used_torch_chunk": torch.tensor(float(use_torch_chunk_path and not use_fla_path), device=hidden_states.device),
+            "used_recurrent": torch.tensor(float(use_recurrent_path), device=hidden_states.device),
         }
         return attended, state, stats
 
@@ -687,6 +703,8 @@ class SGSABlock(nn.Module):
             ),
             "retrieval_confidence_mean": retrieval["diagnostics"]["max_confidence"].mean(),
             "used_fla_gdn": state_stats["used_fla_gdn"],
+            "used_torch_chunk": state_stats["used_torch_chunk"],
+            "used_recurrent": state_stats["used_recurrent"],
         }
         return hidden_states, metrics
 
@@ -733,6 +751,8 @@ class SGSAForCausalLM(nn.Module):
             all_metrics[f"layer_{idx}_k_hat_perp_ratio_mean"] = metrics["k_hat_perp_ratio_mean"]
             all_metrics[f"layer_{idx}_retrieval_confidence_mean"] = metrics["retrieval_confidence_mean"]
             all_metrics[f"layer_{idx}_used_fla_gdn"] = metrics["used_fla_gdn"]
+            all_metrics[f"layer_{idx}_used_torch_chunk"] = metrics["used_torch_chunk"]
+            all_metrics[f"layer_{idx}_used_recurrent"] = metrics["used_recurrent"]
 
         logits = self.lm_head(self.norm(hidden_states))
         output: Dict[str, Tensor] = {"logits": logits, "metrics": all_metrics}
