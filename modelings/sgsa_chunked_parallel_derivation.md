@@ -419,13 +419,19 @@ $$
 
 ## 8. chunk 内 readout
 
-如果要得到每个位置的输出：
+前面第 5–7 节解决的是：**不显式顺序更新 $W_t$，一次性求出所有 residual $R$ 和 chunk 末状态 $W_L$。**
+
+但模型真正要用的输出是：
 
 $$
-o_t=W_tq_t
+o_t=W_tq_t\in\mathbb{R}^{d_v}
 $$
 
-可以展开：
+也就是每个 token 位置都要做一次 state readout。这一节说明：**在已经得到 $R=(I+T)^{-1}B$ 之后，chunk 内所有 $o_t$ 也可以并行算，不需要再顺序递推 $W_1,\dots,W_L$。**
+
+### 8.1 从 $W_t$ 展开到 readout
+
+和第 4 节对 $W_{t-1}$ 的展开完全同构，只是求和上限变成 $j\le t$，并且 decay product 要传播到第 $t$ 步本身：
 
 $$
 W_t
@@ -435,29 +441,262 @@ W_t
 r_jk_j^\top
 $$
 
-因此：
+定义 readout 用的 decay product：
+
+$$
+H_{j\rightarrow t}^{\text{read}}
+=\prod_{p=j+1}^{t}\gamma_p
+$$
+
+当 $j=t$ 时这是空乘积，值为 $1$。注意它和 residual 方程里的 $G_{j\rightarrow t}$ 差一个因子：
+
+$$
+G_{j\rightarrow t}=\prod_{p=j+1}^{t-1}\gamma_p
+$$
+
+$$
+H_{j\rightarrow t}^{\text{read}}
+=
+\begin{cases}
+G_{j\rightarrow t}\cdot\gamma_t, & j<t\\
+1, & j=t
+\end{cases}
+$$
+
+直觉上：$r_j$ 是在第 $j$ 步写入 state 的 correction；readout 用的是更新后的 $W_t$，所以 $j<t$ 的写入还要多经历一步 $\gamma_t$ decay。
+
+两边右乘 $q_t$：
 
 $$
 o_t
 =D_tW_0q_t
 +\sum_{j\le t}\beta_j
-\left(\prod_{p=j+1}^{t}\gamma_p\right)
+H_{j\rightarrow t}^{\text{read}}
 r_j(k_j^\top q_t)
 $$
 
-这也是一个 causal attention-like computation：
+这就是 readout 的两部分：
 
-- query 是 $q_t$；
-- key 是 $k_j$；
-- value 是 residual $r_j$；
-- 额外权重是 $\beta_j$ 和 decay product。
+1. **baseline**：$D_tW_0q_t$，只依赖初始状态 $W_0$ 和 prefix decay。
+2. **memory**：对所有过去 residual 做 causal weighted sum，权重由 $\beta_j$、decay product 和 query-key 相似度 $k_j^\top q_t$ 共同决定。
 
-所以 GDN 的分块并行可以概括为：
+### 8.2 矩阵形式：一次算出所有 $o_t$
+
+把 queries 按行堆成：
+
+$$
+Q=
+\begin{bmatrix}
+q_1^\top\\
+q_2^\top\\
+\vdots\\
+q_L^\top
+\end{bmatrix}
+\in\mathbb{R}^{L\times d_k}
+$$
+
+把所有输出按行堆成：
+
+$$
+O=
+\begin{bmatrix}
+o_1^\top\\
+o_2^\top\\
+\vdots\\
+o_L^\top
+\end{bmatrix}
+\in\mathbb{R}^{L\times d_v}
+$$
+
+baseline 部分：
+
+$$
+O^{(0)}
+=\operatorname{diag}(D_1,D_2,\dots,D_L)\,QW_0^\top
+$$
+
+其中 $(QW_0^\top)_t=W_0q_t$。
+
+memory 部分定义 strictly lower-triangular（含对角）的 readout kernel：
+
+$$
+A_{t,j}^{\text{read}}
+=
+\begin{cases}
+\beta_j
+H_{j\rightarrow t}^{\text{read}}
+(k_j^\top q_t), & j\le t\\
+0, & j>t
+\end{cases}
+$$
+
+则：
+
+$$
+O=O^{(0)}+A^{\text{read}}R
+$$
+
+形状检查：
+
+- $A^{\text{read}}\in\mathbb{R}^{L\times L}$
+- $R\in\mathbb{R}^{L\times d_v}$
+- 所以 $A^{\text{read}}R\in\mathbb{R}^{L\times d_v}$
+
+和 $O$ 一致。
+
+### 8.3 用 prefix decay 并行构造 $A^{\text{read}}$
+
+和第 6 节构造 $T$ 的方法平行。先 recall：
+
+$$
+D_t=\prod_{p=1}^{t}\gamma_p,\quad D_0=1
+$$
+
+则 readout decay product 可以写成比值：
+
+$$
+H_{j\rightarrow t}^{\text{read}}=\frac{D_t}{D_j}
+\qquad (j\le t)
+$$
+
+验证：$j=t$ 时 $D_t/D_t=1$；$j<t$ 时 $D_t/D_j=\gamma_{j+1}\cdots\gamma_t$。
+
+再算 query-key Gram：
+
+$$
+G^{QK}=QK^\top
+$$
+
+其中：
+
+$$
+G^{QK}_{t,j}=q_t^\top k_j
+$$
+
+于是：
+
+$$
+A_{t,j}^{\text{read}}
+=\mathbf{1}[j\le t]\,
+\beta_j
+\frac{D_t}{D_j}
+G^{QK}_{t,j}
+$$
+
+全部 readout：
+
+$$
+O
+=
+\operatorname{diag}(D_1,\dots,D_L)\,QW_0^\top
++
+\left(
+\mathbf{1}[j\le t]\odot
+\operatorname{diag}(\beta)\,
+(D_t/D_j)\odot
+G^{QK}
+\right)R
+$$
+
+这里 $\odot$ 表示按元素乘，$(D_t/D_j)$ 是一个 $L\times L$ 矩阵，第 $(t,j)$ 元素是 $D_t/D_j$。
+
+**计算顺序**（在已有 $R$ 的前提下）：
+
+1. 算 prefix decay $D_1,\dots,D_L$。
+2. 算 $G^{QK}=QK^\top$ 和 baseline $O^{(0)}=\operatorname{diag}(D)QW_0^\top$。
+3. 构造 $A^{\text{read}}$（只用 $\beta$、$D$、$G^{QK}$）。
+4. $O=O^{(0)}+A^{\text{read}}R$。
+
+第 1–3 步都不依赖 $R$，可以和 triangular solve 的前置构造部分重叠；第 4 步在得到 $R$ 后做一次矩阵乘即可。
+
+### 8.4 和 $T$ 的对比：solve 与 readout 用不同的 kernel
+
+容易混淆的是 $T$ 和 $A^{\text{read}}$。它们都是 lower-triangular causal kernel，但作用不同：
+
+| | $T$（residual solve） | $A^{\text{read}}$（readout） |
+| --- | --- | --- |
+| 目的 | 解 $(I+T)R=B$ | 算 $O=O^{(0)}+A^{\text{read}}R$ |
+| 内积 | $k_j^\top k_t$ | $k_j^\top q_t$ |
+| decay | $G_{j\rightarrow t}=D_{t-1}/D_j$（到 $t-1$） | $H_{j\rightarrow t}^{\text{read}}=D_t/D_j$（到 $t$） |
+| 对角 | 严格下三角，$T_{t,t}=0$ | 含对角，$A^{\text{read}}_{t,t}=\beta_t$ |
+
+关键差异：
+
+- **solve** 里的 $T_{t,j}$ 描述“第 $j$ 个 residual 通过旧状态 $W_{t-1}$ 影响第 $t$ 个 residual 的预测”。
+- **readout** 里的 $A^{\text{read}}_{t,j}$ 描述“第 $j$ 个 residual 写入后，传播到 readout 时刻 $t$ 的贡献”。
+
+所以 triangular solve 和 readout 共享同一个 $R$，但各自有独立的 $L\times L$ kernel matrix。
+
+### 8.5 causal attention 视角
+
+把 readout 的 memory 项单独写出来：
+
+$$
+o_t^{\text{mem}}
+=\sum_{j\le t}
+\underbrace{
+\beta_j
+H_{j\rightarrow t}^{\text{read}}
+(k_j^\top q_t)
+}_{\text{score }s_{t,j}}
+r_j
+$$
+
+这就是一个 causal linear attention：
+
+- **query**：$q_t$
+- **key**：$k_j$
+- **value**：residual $r_j$（不是原始 $v_j$）
+- **score**：$s_{t,j}=\beta_j H_{j\rightarrow t}^{\text{read}}(k_j^\top q_t)$
+
+和 softmax attention 的区别：
+
+1. 没有 $\exp$ 和归一化；score 是线性的。
+2. value 是 triangular solve 解出的 $r_j$，已经编码了“过去写入之间的互相修正”。
+3. 额外乘了 step size $\beta_j$ 和 decay product。
+
+因此 GDN chunk 的完整流程不是“先 attention 再 update”，而是：
+
+1. 先通过 $(I+T)R=B$ 解出所有 correction $r_j$；
+2. 再用 $A^{\text{read}}$ 把这些 correction 读出来。
+
+### 8.6 概念伪代码
+
+```python
+# Inputs (same chunk as sections 5-7):
+# W0: (dv, dk)
+# gamma: (L,)
+# K: (L, dk), V: (L, dv), Q: (L, dk)
+# beta: (L,)
+# R: (L, dv)   # already from (I+T)^{-1} B
+
+# 1. Prefix decay: D[t] = prod_{p=1..t} gamma[p], D[0]=1  (1-indexed token id t)
+D = prefix_prod(gamma)                 # length L
+
+# 2. Baseline readout
+O0 = diag(D) @ (Q @ W0.T)              # (L, dv)
+
+# 3. Readout kernel
+GQK = Q @ K.T                          # (L, L), GQK[t,j] = q_t · k_j
+decay_ratio = D[:, None] / D[None, :]  # (L, L), [t,j] = D_t / D_j
+A_read = tril(beta[None, :] * decay_ratio * GQK)  # lower incl. diagonal
+
+# 4. Memory + total output
+O = O0 + A_read @ R                    # (L, dv)
+```
+
+如果只需要 chunk 末状态 $W_L$ 而不需要中间 $o_t$，可以跳过整节 readout，直接用第 7 节的矩阵公式。实际训练中通常**两者都要**：$O$ 供当前层输出和反向传播，$W_L$ 供下一 chunk 递推。
+
+### 8.7 小结
+
+GDN 的分块并行可以概括为：
 
 1. 并行构造 $T$ 和 $B$。
 2. 用 triangular solve 得到所有 residual $R$。
-3. 用 causal kernel 形式得到 chunk 内输出。
+3. 用 readout kernel $A^{\text{read}}$ 并行得到 chunk 内所有 $o_t$。
 4. 用矩阵公式得到 chunk 末状态 $W_L$。
+
+其中第 2 步和第 3 步共享 $R$，但 $T$ 与 $A^{\text{read}}$ 是两个不同的 causal kernel。
 
 ## 9. SGSA 的顺序形式
 
@@ -737,6 +976,143 @@ $$
 
 这保证两个写入都读同一个 $W_{t-1}$。
 
+### 13.1 如何并行构造 $T^{\text{SGSA}}$ 和 $B$
+
+SGSA 的构造方式和 GDN 第 6 节完全平行，只是所有矩阵都从真实 token 维度 $L$ 变成虚拟样本维度 $M=2L$，并且 causal mask 从 $j<i$ 变成 $\tau_j<\tau_i$。
+
+把虚拟写入 key 堆成：
+
+$$
+\mathcal{K}=
+\begin{bmatrix}
+\kappa_1^\top\\
+\kappa_2^\top\\
+\vdots\\
+\kappa_M^\top
+\end{bmatrix}
+\in\mathbb{R}^{M\times d_k}
+$$
+
+把虚拟 target value 堆成：
+
+$$
+\mathcal{V}=
+\begin{bmatrix}
+\nu_1^\top\\
+\nu_2^\top\\
+\vdots\\
+\nu_M^\top
+\end{bmatrix}
+\in\mathbb{R}^{M\times d_v}
+$$
+
+先算虚拟 key 的 Gram matrix：
+
+$$
+G^{\kappa}=\mathcal{K}\mathcal{K}^\top
+$$
+
+其中：
+
+$$
+G^{\kappa}_{i,j}=\kappa_i^\top\kappa_j
+$$
+
+再构造真实时间 causal mask：
+
+$$
+M^{\tau}_{i,j}=\mathbf{1}[\tau_j<\tau_i]
+$$
+
+这个 mask 的形状是 $M\times M$。如果采用 interleave 顺序：
+
+$$
+(1,\text{local}),(1,\text{sparse}),(2,\text{local}),(2,\text{sparse}),\dots
+$$
+
+那么 $M^{\tau}$ 看起来像 block lower-triangular mask：每个真实 token 对应一个 $2\times2$ block，对角 block 全是 0，下面的 block 全是 1。也就是说，第 $t$ 个 token 的两个虚拟样本可以看见所有更早 token 的两个虚拟样本，但不能互相看见。
+
+decay matrix 只依赖真实时间：
+
+$$
+G^{\gamma,\text{SGSA}}_{i,j}
+=
+\begin{cases}
+\prod_{p=\tau_j+1}^{\tau_i-1}\gamma_p, & \tau_j<\tau_i\\
+0, & \tau_j\ge\tau_i
+\end{cases}
+$$
+
+也可以用 prefix decay 写成：
+
+$$
+G^{\gamma,\text{SGSA}}_{i,j}
+=
+\mathbf{1}[\tau_j<\tau_i]\frac{D_{\tau_i-1}}{D_{\tau_j}}
+$$
+
+因为：
+
+$$
+\frac{D_{\tau_i-1}}{D_{\tau_j}}
+=
+\gamma_{\tau_j+1}\gamma_{\tau_j+2}\cdots\gamma_{\tau_i-1}
+$$
+
+于是：
+
+$$
+T^{\text{SGSA}}_{i,j}
+=
+M^{\tau}_{i,j}
+\lambda_j
+G^{\gamma,\text{SGSA}}_{i,j}
+G^{\kappa}_{i,j}
+$$
+
+注意这里 $G^{\kappa}_{i,j}=\kappa_i^\top\kappa_j$，而前面逐项公式写的是 $\kappa_j^\top\kappa_i$，两者是同一个标量。
+
+再构造 $B$。先计算所有虚拟样本在初始状态下的 prediction：
+
+$$
+P_i=W_0\kappa_i
+$$
+
+按行堆起来：
+
+$$
+P=\mathcal{K}W_0^\top\in\mathbb{R}^{M\times d_v}
+$$
+
+第 $i$ 个虚拟样本读取的是真实时间 $\tau_i$ 的旧状态 $W_{\tau_i-1}$。只考虑初始状态项时，对应 decay 是 $D_{\tau_i-1}$，所以：
+
+$$
+B=\mathcal{V}
+-\operatorname{diag}(D_{\tau_1-1},D_{\tau_2-1},\dots,D_{\tau_M-1})P
+$$
+
+现在 $T^{\text{SGSA}}$ 和 $B$ 都可以并行构造，然后一次 triangular solve：
+
+$$
+(I+T^{\text{SGSA}})R=B
+$$
+
+实现上不需要真的 materialize 每个 diagonal matrix。常见写法是：
+
+```python
+pred = kappa @ W0.T                         # (M, dv)
+B = nu - D[tau - 1, None] * pred            # (M, dv)
+
+gram = kappa @ kappa.T                      # (M, M)
+mask = tau[None, :] < tau[:, None]          # mask[i,j] = tau[j] < tau[i]
+decay = D[tau - 1, None] / D[tau[None, :]]  # D_{tau_i-1} / D_{tau_j}
+T = mask * lam[None, :] * decay * gram
+
+R = solve_triangular(I + T, B)              # (M, dv)
+```
+
+上面的 `decay` 在 `mask=False` 的位置没有数学意义，但最后会被 mask 掉；实际实现中可以先构造 mask 再安全填充，避免除以很小的 prefix decay。
+
 ## 14. SGSA chunk 末状态
 
 chunk 末状态是：
@@ -795,7 +1171,224 @@ $$
 d_v\times d_k
 $$
 
-## 15. 为什么 gate 必须 state-independent
+## 15. SGSA chunk 内 readout
+
+SGSA 的 chunk 末状态只用于传给下一个 chunk。当前 chunk 内每个真实 token 的层输出仍然需要：
+
+$$
+o_t=W_tq_t
+$$
+
+这里的 $W_t$ 是真实 token $t$ 完成 local write 和 sparse write 之后的状态。因为 SGSA 里同 token 的两个虚拟样本都是同时写入，所以 readout 时应该包含：
+
+$$
+\tau_i\le t
+$$
+
+的所有虚拟写入。
+
+### 15.1 从虚拟样本展开 $W_t$
+
+由第 12 节的状态展开可得，更新到真实 token $t$ 之后：
+
+$$
+W_t
+=D_tW_0
++\sum_{i:\tau_i\le t}
+\lambda_i
+\left(\prod_{p=\tau_i+1}^{t}\gamma_p\right)
+\rho_i\kappa_i^\top
+$$
+
+定义 SGSA readout decay：
+
+$$
+H^{\text{read}}_{i\rightarrow t}
+=
+\prod_{p=\tau_i+1}^{t}\gamma_p
+$$
+
+当 $\tau_i=t$ 时，$H^{\text{read}}_{i\rightarrow t}=1$。这表示同一个真实 token 的 local/sparse 两个写入，都会直接进入该 token 的 readout，不再额外乘 $\gamma_t$。
+
+右乘 $q_t$：
+
+$$
+o_t
+=D_tW_0q_t
++\sum_{i:\tau_i\le t}
+\lambda_i
+H^{\text{read}}_{i\rightarrow t}
+\rho_i(\kappa_i^\top q_t)
+$$
+
+这和 GDN 第 8 节的形式完全一致，只是求和对象从真实 token residual $r_j$ 变成虚拟 residual $\rho_i$。
+
+### 15.2 矩阵形式：一次得到所有真实 token 输出
+
+把真实 token 的 query 堆成：
+
+$$
+Q=
+\begin{bmatrix}
+q_1^\top\\
+q_2^\top\\
+\vdots\\
+q_L^\top
+\end{bmatrix}
+\in\mathbb{R}^{L\times d_k}
+$$
+
+把输出堆成：
+
+$$
+O=
+\begin{bmatrix}
+o_1^\top\\
+o_2^\top\\
+\vdots\\
+o_L^\top
+\end{bmatrix}
+\in\mathbb{R}^{L\times d_v}
+$$
+
+baseline 部分仍然是：
+
+$$
+O^{(0)}
+=\operatorname{diag}(D_1,D_2,\dots,D_L)QW_0^\top
+$$
+
+memory 部分需要一个 $L\times M$ 的 readout kernel，而不是 $M\times M$：
+
+$$
+A^{\text{SGSA-read}}_{t,i}
+=
+\begin{cases}
+\lambda_i
+H^{\text{read}}_{i\rightarrow t}
+(\kappa_i^\top q_t), & \tau_i\le t\\
+0, & \tau_i>t
+\end{cases}
+$$
+
+于是：
+
+$$
+O
+=O^{(0)}+A^{\text{SGSA-read}}R
+$$
+
+形状检查：
+
+- $A^{\text{SGSA-read}}\in\mathbb{R}^{L\times M}$
+- $R\in\mathbb{R}^{M\times d_v}$
+- $A^{\text{SGSA-read}}R\in\mathbb{R}^{L\times d_v}$
+
+所以结果正好是所有真实 token 的输出 $O$。
+
+### 15.3 如何并行构造 $A^{\text{SGSA-read}}$
+
+先算 query 和虚拟 write key 的 Gram matrix：
+
+$$
+G^{Q\kappa}=Q\mathcal{K}^\top
+$$
+
+其中：
+
+$$
+G^{Q\kappa}_{t,i}=q_t^\top\kappa_i
+$$
+
+构造 readout mask：
+
+$$
+M^{\text{read}}_{t,i}=\mathbf{1}[\tau_i\le t]
+$$
+
+注意这里是 $\le$，不是 $<$。原因是 $o_t=W_tq_t$ 读取的是第 $t$ 个 token 写完之后的 state，所以同 token 的 local/sparse 两个写入都应该参与当前 token 的输出。
+
+readout decay 可以用 prefix decay 比值表示：
+
+$$
+H^{\text{read}}_{i\rightarrow t}
+=\frac{D_t}{D_{\tau_i}}
+\qquad(\tau_i\le t)
+$$
+
+于是：
+
+$$
+A^{\text{SGSA-read}}_{t,i}
+=
+M^{\text{read}}_{t,i}
+\lambda_i
+\frac{D_t}{D_{\tau_i}}
+G^{Q\kappa}_{t,i}
+$$
+
+这一步只依赖 $Q$、$\mathcal{K}$、$\lambda$、$\tau$、$\gamma$，不依赖未知 residual。因此可以和 $T^{\text{SGSA}}$、$B$ 的构造并行准备；真正需要等待 triangular solve 的只有最后一乘：
+
+$$
+A^{\text{SGSA-read}}R
+$$
+
+概念伪代码：
+
+```python
+# Q: (L, dk)
+# kappa: (M, dk)
+# lam: (M,)
+# tau: (M,) with values in 1..L
+# D: prefix decay with D[0]=1 and D[t]=prod_{p=1..t} gamma[p]
+# R: (M, dv), from SGSA triangular solve
+
+O0 = diag(D[1:]) @ (Q @ W0.T)                 # (L, dv)
+
+gqk = Q @ kappa.T                              # (L, M)
+t_real = arange(1, L + 1)                      # (L,)
+read_mask = tau[None, :] <= t_real[:, None]    # (L, M)
+read_decay = D[1:, None] / D[tau[None, :]]     # D_t / D_{tau_i}
+
+A_read = read_mask * lam[None, :] * read_decay * gqk
+O = O0 + A_read @ R                            # (L, dv)
+```
+
+和第 13 节一样，`read_decay` 在 mask 外的位置可以先算出来再 mask 掉；更稳健的实现会在 mask 外填 0，避免不必要的数值问题。
+
+### 15.4 与 SGSA residual solve kernel 的区别
+
+SGSA 里至少有两个 causal kernel：
+
+| | $T^{\text{SGSA}}$ | $A^{\text{SGSA-read}}$ |
+| --- | --- | --- |
+| 形状 | $M\times M$ | $L\times M$ |
+| 目的 | 解虚拟 residual $R$ | 从 $R$ 得到真实 token 输出 $O$ |
+| 行索引 | 虚拟样本 $i$ | 真实 token $t$ |
+| 列索引 | 虚拟样本 $j$ | 虚拟样本 $i$ |
+| causal 条件 | $\tau_j<\tau_i$ | $\tau_i\le t$ |
+| 内积 | $\kappa_j^\top\kappa_i$ | $\kappa_i^\top q_t$ |
+| decay | $D_{\tau_i-1}/D_{\tau_j}$ | $D_t/D_{\tau_i}$ |
+| 对同 token 写入 | 不可见 | 可见 |
+
+这个差异很重要：
+
+- residual solve 用的是旧状态 $W_{\tau_i-1}$，所以同 token 两个虚拟样本不能互相影响。
+- readout 用的是更新后状态 $W_t$，所以当前 token 的 local/sparse 两个写入都应该出现在 $o_t$ 里。
+
+### 15.5 完整 chunk 内流程
+
+SGSA 单 chunk 的并行流程可以概括为：
+
+1. 先用 local 和 sparse retrieval 结果构造虚拟样本 $(\kappa_i,\nu_i,\lambda_i,\tau_i)$。
+2. 并行构造 $B$ 和 $T^{\text{SGSA}}$。
+3. triangular solve 得到所有虚拟 residual $R$。
+4. 用 $A^{\text{SGSA-read}}R$ 得到当前 chunk 的所有真实 token 输出 $O$。
+5. 用第 14 节公式得到 chunk 末状态 $W_L$。
+
+训练和推理通常都需要第 4 步的 $O$；跨 chunk 递推需要第 5 步的 $W_L$。两者共享同一个 $R$，但使用不同的投影 kernel。
+
+## 16. 为什么 gate 必须 state-independent
 
 上面的推导能成立，是因为 $\lambda_i$、$\kappa_i$、$\nu_i$、$\gamma_t$ 在求 residual 之前都已经确定。
 
@@ -844,7 +1437,7 @@ $$
 
 这些可以作为 recurrent ablation 或离线诊断，但会破坏精确 chunked parallel。
 
-## 16. SGSA chunked parallel 的伪代码
+## 17. SGSA chunked parallel 的伪代码
 
 下面是单 chunk、单 head 的概念伪代码。这里不是最终高性能实现，只是为了对应上面的公式。
 
@@ -852,6 +1445,7 @@ $$
 # Inputs:
 # W0: (dv, dk)
 # gamma: (L,)
+# q: (L, dk)
 # k: (L, dk)
 # v: (L, dv)
 # k_sparse: (L, dk)      # tilde k_t
@@ -863,44 +1457,44 @@ $$
 kappa = interleave(k, k_sparse)       # (M=2L, dk)
 nu = interleave(v, v_sparse)          # (M=2L, dv)
 lam = interleave(beta, alpha)         # (M,)
-tau = [1, 1, 2, 2, ..., L, L]         # (M,)
+tau = tensor([1, 1, 2, 2, ..., L, L]) # (M,)
+t_real = tensor([1, 2, ..., L])       # (L,)
 
 # 2. Prefix decay.
-D[t] = prod_{p=1..t} gamma[p]
+# D[0] = 1, D[t] = prod_{p=1..t} gamma[p], with 1-indexed token id t.
+D = prefix_prod_with_initial_one(gamma)  # (L+1,)
 
-# 3. Initial prediction term.
+# 3. Initial prediction term for residual solve.
 # b_i = nu_i - D_{tau_i-1} W0 kappa_i
 pred = kappa @ W0.T                   # (M, dv)
 b = nu - D[tau - 1, None] * pred      # (M, dv)
 
-# 4. Build Gram over virtual write keys.
+# 4. Build SGSA residual solve kernel T.
 gram = kappa @ kappa.T                # (M, M)
+solve_mask = tau[None, :] < tau[:, None]
+solve_decay = D[tau - 1, None] / D[tau[None, :]]
+T = solve_mask * lam[None, :] * solve_decay * gram
 
-# 5. Build real-time causal mask.
-mask[i, j] = tau[j] < tau[i]
-
-# 6. Build decay from virtual sample j to i.
-decay[i, j] = prod_{p=tau[j]+1..tau[i]-1} gamma[p]
-
-# 7. Build triangular matrix.
-T[i, j] = mask[i, j] * lam[j] * decay[i, j] * gram[i, j]
-
-# 8. Solve residuals.
+# 5. Solve virtual residuals.
 R = solve_triangular(I + T, b)         # (M, dv)
 
-# 9. Chunk final state.
-H[i] = prod_{p=tau[i]+1..L} gamma[p]
-W_out = D[L] * W0 + R.T @ diag(lam * H) @ kappa
-```
+# 6. Chunk readout: O = O0 + A_read @ R.
+O0 = diag(D[1:]) @ (q @ W0.T)          # (L, dv)
+gqk = q @ kappa.T                      # (L, M)
+read_mask = tau[None, :] <= t_real[:, None]
+read_decay = D[1:, None] / D[tau[None, :]]
+A_read = read_mask * lam[None, :] * read_decay * gqk
+O = O0 + A_read @ R                    # (L, dv)
 
-实现时不一定要显式 `diag(lam * H)`，可以写成：
-
-```python
+# 7. Chunk final state for the next chunk.
+H = D[L] / D[tau]                      # H_i = prod_{p=tau_i+1..L} gamma[p]
 weighted_R = R * (lam * H)[:, None]
 W_out = D[L] * W0 + weighted_R.T @ kappa
 ```
 
-## 17. 和普通 GDN 相比到底多了什么
+这里 `T` 和 `A_read` 是两个不同的 kernel：`T` 解 residual，`A_read` 读出真实 token 输出。两者都可以在 solve 前构造；只有 `R = solve_triangular(...)` 以及之后的 `O = O0 + A_read @ R`、`W_out` 需要依赖求解结果。
+
+## 18. 和普通 GDN 相比到底多了什么
 
 普通 GDN：
 
@@ -948,7 +1542,7 @@ $$
 
 如果错误地使用 $j<i$，那么同 token 的 local sample 会影响 sparse sample，或者 sparse sample 会影响 local sample，取决于 interleave 顺序。这会改变原始 SGSA 公式，因为原始公式要求它们都读取 $W_{t-1}$。
 
-## 18. 关于 residual subspace write
+## 19. 关于 residual subspace write
 
 如果使用 residual subspace 版本：
 
@@ -973,7 +1567,7 @@ $$
 
 注意不要把 residual subspace write 理解为“local/sink token 一定被抑制”。它只抑制与当前 $k_t$ 共线的写入分量。sink token 如果是独立全局方向，仍然可以写入。
 
-## 19. 关于 sparse retrieval
+## 20. 关于 sparse retrieval
 
 SGSA 的 sparse retrieval 也必须在 state update 前完成。典型流程：
 
@@ -1002,7 +1596,7 @@ $$
 - score margin；
 - distance bucket。
 
-## 20. 跨 chunk 的并行 scan
+## 21. 跨 chunk 的并行 scan
 
 上面讲的是一个 chunk 内怎么求 $W_{\text{out}}$。如果序列很长，会有多个 chunk。
 
@@ -1053,7 +1647,7 @@ $$
 
 这解释了为什么理论上 affine recurrence 可以 scan。但实际高效实现通常避免显式形成大的 $d_k\times d_k$ transition，而是在 chunk 内用 Gram matrix 和 triangular solve。
 
-## 21. 常见错误
+## 22. 常见错误
 
 ### 错误 1：让 gate 依赖 online residual
 
@@ -1097,7 +1691,7 @@ $$
 
 不会。它只过滤和当前 $k_t$ 共线的部分。sink token 如果提供独立方向，仍然会保留。
 
-## 22. 最短总结
+## 23. 最短总结
 
 GDN 能 chunked parallel，是因为 residual 满足：
 
@@ -1119,7 +1713,7 @@ $$
 (I+T^{\text{SGSA}})R=B
 $$
 
-唯一需要特别注意的是 mask：
+residual solve 唯一需要特别注意的是 mask：
 
 $$
 T^{\text{SGSA}}_{i,j}\neq0
@@ -1128,3 +1722,19 @@ T^{\text{SGSA}}_{i,j}\neq0
 $$
 
 也就是说，同一个真实 token 内的 local/sparse writes 不能互相依赖。这样它们才都对应原始公式里的 $W_{t-1}$。
+
+得到 $R$ 后，chunk 内真实 token 输出也可以并行得到：
+
+$$
+O=O^{(0)}+A^{\text{SGSA-read}}R
+$$
+
+其中 readout mask 是：
+
+$$
+A^{\text{SGSA-read}}_{t,i}\neq0
+\quad\text{only if}\quad
+\tau_i\le t
+$$
+
+这里是 $\le$，因为 $o_t=W_tq_t$ 读取的是 token $t$ 写入后的状态，所以同 token 的 local/sparse writes 应该参与当前 token 的输出。
